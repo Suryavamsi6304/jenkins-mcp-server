@@ -11,7 +11,14 @@ from app.jenkins_client import (
     get_all_views,
 )
 from app.analyzer import analyze_log
-from app.config import JENKINS_FETCH_TIMEOUT_SECONDS, JENKINS_MAX_WORKERS, JOBS_CACHE_TTL_SECONDS, MAX_BUILDS_PER_JOB
+from app import index
+from app.config import (
+    JENKINS_FETCH_TIMEOUT_SECONDS,
+    JENKINS_MAX_WORKERS,
+    JOBS_CACHE_TTL_SECONDS,
+    MAX_BUILDS_PER_JOB,
+    MAX_JOBS_PER_RESPONSE,
+)
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin
@@ -426,58 +433,108 @@ def get_build_history(
     }
 
 
-# ---------------- ✅ FIXED ALL JOB STATUS ----------------
-def get_all_jobs_status(folder_name=None):
-    jobs = get_all_jobs_recursive(folder_name=folder_name)
+# ---------------- ALL JOB STATUS ----------------
+def get_all_jobs_status(folder_name=None, limit=None):
+    """
+    Latest build status for Jenkins jobs, served from the background index.
 
-    # Jobs discovered via the skeleton query already carry their latest build;
-    # only jobs missing that (e.g. branches Jenkins didn't return lastBuild for)
-    # need a live per-job Jenkins request.
-    jobs_with_status = [job for job in jobs if job.get("status_known")]
-    jobs_needing_fetch = [job for job in jobs if not job.get("status_known")]
+    Returns every matching job by default. `limit` only pages the response when
+    a caller explicitly asks; it never silently drops jobs.
 
-    fetch_deadline = time.monotonic() + JENKINS_FETCH_TIMEOUT_SECONDS
-    fetched, fetch_truncated = _map_concurrently(
-        get_latest_build, jobs_needing_fetch, deadline=fetch_deadline
-    ) if jobs_needing_fetch else ([], False)
+    Three outcomes that used to look identical are now distinct:
+      * Jenkins unreachable        -> an error, not an empty `jobs` list
+      * folder name does not match -> not_found / ambiguous, with candidates
+      * folder exists but is empty -> an honest zero, with the folder resolved
 
-    results = []
-    for job in jobs_with_status:
-        if job.get("build_number") is None:
-            continue
-        results.append({
-            "job": job.get("name"),
-            "job_url": job.get("url"),
-            "build_number": job.get("build_number"),
-            "status": job.get("status"),
-            "duration": job.get("duration"),
-            "timestamp": job.get("timestamp"),
-        })
+    Every response carries `as_of` so the caller can state how fresh the data is.
+    """
+    snapshot = index.ensure()
+    if snapshot is None:
+        return {
+            "status": "index_unavailable",
+            "error": "Jenkins job index is unavailable",
+            "detail": (
+                "The server could not reach Jenkins to build its job index. "
+                "This is not a report that zero jobs exist."
+            ),
+        }
 
-    for latest in fetched:
-        if not latest:
-            continue
-        results.append({
-            "job": latest["job"],
-            "job_url": latest["job_url"],
-            "build_number": latest["build_number"],
-            "status": latest["status"],
-            "duration": latest["duration"],
-            "timestamp": latest["timestamp"]
-        })
+    folder = None
+    if folder_name:
+        resolution = index.resolve_folder(folder_name, snapshot)
+        if resolution.status == "not_found":
+            return {
+                "status": "not_found",
+                "error": f"No Jenkins folder matches {folder_name!r}",
+                "query": folder_name,
+                "did_you_mean": list(resolution.candidates),
+                "as_of": snapshot.as_of_iso,
+            }
+        if resolution.status == "ambiguous":
+            return {
+                "status": "ambiguous",
+                "error": f"{folder_name!r} matches more than one Jenkins folder",
+                "query": folder_name,
+                "candidates": list(resolution.candidates),
+                "as_of": snapshot.as_of_iso,
+            }
+        folder = resolution.value
 
-    return {
-        "total_builds": len(results),
+    matching = snapshot.jobs_under(folder)
+
+    requested_limit = limit if limit is not None else MAX_JOBS_PER_RESPONSE
+    page = matching
+    if requested_limit and int(requested_limit) > 0:
+        page = matching[: int(requested_limit)]
+
+    results = [
+        {
+            "job": job.name,
+            "job_url": job.url,
+            "build_number": job.build_number,
+            "status": job.status,
+            "duration": job.duration,
+            "timestamp": job.timestamp,
+        }
+        for job in page
+    ]
+
+    response = {
+        "status": "ok",
+        "folder": folder,
+        "total_matching": len(matching),
+        "returned": len(results),
         "jobs": results,
-        "jobs_discovered": len(jobs),
-        "truncated": bool(getattr(jobs, "truncated", False)) or fetch_truncated,
+        "as_of": snapshot.as_of_iso,
+        "age_seconds": round(snapshot.age_seconds, 1),
+        "stale": snapshot.stale,
+        "complete": snapshot.complete,
+        # Kept so callers still reading the old field name keep working.
+        "total_builds": len(results),
     }
+    if len(results) < len(matching):
+        response["truncated_by_limit"] = True
+        response["hint"] = (
+            f"Showing {len(results)} of {len(matching)} jobs because limit="
+            f"{requested_limit} was requested. Omit limit to get all of them."
+        )
+    if not snapshot.complete:
+        # The index only publishes partial data as a last resort; say so rather
+        # than letting a short list read as the whole truth.
+        response["partial_index"] = True
+        response["index_errors"] = list(snapshot.errors[:5])
+    return response
 
 
 # ----------------  FIXED FAILED JOBS ----------------
 def get_failed_jobs(folder_name=None):
     if folder_name:
         data = get_all_jobs_status(folder_name=folder_name)
+        if data.get("status") != "ok":
+            # Unresolved folder or unreachable index: hand the caller the reason
+            # rather than an empty failure list that reads as "nothing is broken".
+            return data
+
         failed = [
             j for j in data["jobs"]
             if (j["status"] or "").upper() == "FAILURE"
@@ -486,6 +543,7 @@ def get_failed_jobs(folder_name=None):
         return {
             "failed_count": len(failed),
             "failed_jobs": failed,
+            "as_of": data.get("as_of"),
             "truncated": data.get("truncated", False),
         }
 

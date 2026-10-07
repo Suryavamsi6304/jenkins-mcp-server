@@ -26,54 +26,14 @@ class MapConcurrentlyTests(unittest.TestCase):
         self.assertEqual([2, 4, 6], results)
 
 
-class SkeletonStatusReuseTests(unittest.TestCase):
-    def test_status_known_jobs_skip_the_per_job_status_fetch(self):
-        jobs = [
-            {
-                "name": "Payments/job-a",
-                "url": "https://jenkins.example.test/job/Payments/job/job-a/",
-                "status": "SUCCESS",
-                "build_number": 5,
-                "duration": 1000,
-                "timestamp": 1000,
-                "status_known": True,
-            }
-        ]
-
-        with patch("app.tools.get_all_jobs_recursive", return_value=jobs), patch(
-            "app.tools.get_latest_build"
-        ) as get_latest_build:
-            result = tools.get_all_jobs_status()
-
-        get_latest_build.assert_not_called()
-        self.assertEqual(1, result["total_builds"])
-        self.assertEqual("SUCCESS", result["jobs"][0]["status"])
-
-    def test_jobs_missing_status_still_get_a_live_fetch(self):
-        jobs = [
-            {
-                "name": "Payments/branch-a",
-                "url": "https://jenkins.example.test/job/Payments/job/branch-a/",
-                "status_known": False,
-            }
-        ]
-        latest = {
-            "job": "Payments/branch-a",
-            "job_url": jobs[0]["url"],
-            "build_number": 9,
-            "status": "FAILURE",
-            "duration": 500,
-            "timestamp": 500,
-        }
-
-        with patch("app.tools.get_all_jobs_recursive", return_value=jobs), patch(
-            "app.tools.get_latest_build", return_value=latest
-        ) as get_latest_build:
-            result = tools.get_all_jobs_status()
-
-        get_latest_build.assert_called_once_with(jobs[0])
-        self.assertEqual(1, result["total_builds"])
-        self.assertEqual("FAILURE", result["jobs"][0]["status"])
+# The former SkeletonStatusReuseTests covered get_all_jobs_status walking
+# Jenkins per request and falling back to a per-job get_latest_build. That tool
+# now reads the background index instead and never issues a per-job request, so
+# those assertions no longer describe the design. Replacements live in
+# tests/test_index.py::GetAllJobsTests -- in particular
+# test_served_requests_do_not_hit_jenkins (no live fetch at all) and
+# test_never_built_job_is_reported_not_built_rather_than_dropped (absent
+# lastBuild means NOT_BUILT rather than a second Jenkins round trip).
 
 
 class CacheOptimizationTests(unittest.TestCase):

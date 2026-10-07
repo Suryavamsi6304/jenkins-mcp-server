@@ -18,9 +18,24 @@ mcp = FastMCP("Jenkins MCP Server")
 
 #  Tool 1: All jobs
 @mcp.tool()
-def get_all_jobs(folder_name: str | None = None) -> dict[str, Any]:
-    """Retrieve latest build status for Jenkins jobs, optionally scoped to a top-level folder."""
-    return get_all_jobs_status(folder_name=folder_name)
+def get_all_jobs(folder_name: str | None = None, limit: int | None = None) -> dict[str, Any]:
+    """Retrieve the latest build status for Jenkins jobs.
+
+    Returns every job by default. Set `folder_name` to scope to one folder at
+    any depth; partial, differently-cased and misspelled folder names are
+    resolved automatically.
+
+    Check the `status` field of the response before reading `jobs`:
+      - "ok"                -> `jobs` holds the result; `as_of` says how fresh it is
+      - "not_found"         -> no folder matched; offer `did_you_mean` to the user
+      - "ambiguous"         -> several folders matched; ask the user to pick from `candidates`
+      - "index_unavailable" -> Jenkins could not be reached. This does NOT mean
+                               there are no jobs; report it as a failure to look.
+
+    An empty `jobs` list with status "ok" is a genuine zero. Set `limit` only to
+    page a large result; omitting it returns everything.
+    """
+    return get_all_jobs_status(folder_name=folder_name, limit=limit)
 
 # Tool 2: Failed jobs
 @mcp.tool()

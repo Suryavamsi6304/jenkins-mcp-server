@@ -2,6 +2,7 @@
 import base64
 import hmac
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 
 from mcp_server import mcp
 
+from app import index
 from app.tools import (
     get_all_jobs_status,
     get_failed_jobs,
@@ -53,9 +55,22 @@ class JenkinsMetricsRequest(BaseModel):
     mode: str | None = "count"
 mcp_app = mcp.http_app()
 
+
+@asynccontextmanager
+async def lifespan(fastapi_app):
+    # Warm the job index in the background so requests read a ready snapshot
+    # instead of each paying for a live Jenkins walk.
+    index.start_background_refresh()
+    try:
+        async with mcp_app.lifespan(fastapi_app):
+            yield
+    finally:
+        index.stop_background_refresh()
+
+
 app = FastAPI(
     title="Jenkins MCP Server",
-    lifespan=mcp_app.lifespan,
+    lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -96,7 +111,13 @@ async def require_bearer_token(token: BearerToken = Depends(BearerToken)) -> str
     return token.token
 @app.get("/")
 def health():
-    return {"status": "MCP Server Running"}
+    # Counts only, no job names: enough to see whether the index is warm and how
+    # old it is while testing, without exposing the Jenkins tree unauthenticated.
+    snapshot = index.current()
+    return {
+        "status": "MCP Server Running",
+        "index": snapshot.describe() if snapshot else {"ready": False},
+    }
 @app.get("/.well-known/oauth-authorization-server")
 def oauth_metadata():
     return {
@@ -252,8 +273,8 @@ async def root_post(request: Request):
     }
 # /mcp handlers removed — FastMCP is mounted at /mcp via app.mount
 @app.get("/get_all_jobs_status", dependencies=[Depends(require_bearer_token)])
-def api_all_jobs():
-    return get_all_jobs_status()
+def api_all_jobs(folder_name: str | None = None, limit: int | None = None):
+    return get_all_jobs_status(folder_name=folder_name, limit=limit)
 @app.get("/get_jobs_in_view", dependencies=[Depends(require_bearer_token)])
 def api_get_jobs_in_view(view_name: str | None = None):
     return get_jobs_in_view(view_name=view_name)

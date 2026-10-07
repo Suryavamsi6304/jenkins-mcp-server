@@ -4,6 +4,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from requests.auth import HTTPBasicAuth
+from typing import NamedTuple
 from urllib.parse import quote, urljoin, urlparse
 from urllib3.util.retry import Retry
 from app.config import (
@@ -67,10 +68,33 @@ def _is_trusted_jenkins_url(url):
         return False
 
 
-def _safe_get(url):
+class FetchResult(NamedTuple):
+    """
+    Outcome of one Jenkins request, with "Jenkins said nothing" kept distinct
+    from "we could not ask Jenkins".
+
+    `_safe_get` collapses both into None, which is why a timeout and an empty
+    folder are indistinguishable to its callers. Anything that needs to tell
+    them apart should use `_fetch` instead.
+    """
+
+    ok: bool
+    data: dict | None
+    error: str | None
+
+    @classmethod
+    def success(cls, data):
+        return cls(True, data, None)
+
+    @classmethod
+    def failure(cls, error):
+        return cls(False, None, error)
+
+
+def _fetch(url, timeout=None):
     if not _is_trusted_jenkins_url(url):
         logger.error("Jenkins request rejected because the URL does not match JENKINS_URL")
-        return None
+        return FetchResult.failure("url_not_trusted")
 
     try:
         if not USERNAME or not API_TOKEN:
@@ -83,7 +107,7 @@ def _safe_get(url):
             url,
             auth=HTTPBasicAuth(clean_username, clean_token),
             headers={"Accept": "application/json"},
-            timeout=REQUEST_TIMEOUT,
+            timeout=REQUEST_TIMEOUT if timeout is None else timeout,
             verify=True,
             allow_redirects=False,
         )
@@ -92,16 +116,20 @@ def _safe_get(url):
 
         if response.status_code != 200:
             logger.error("Jenkins API request failed status=%s", response.status_code)
-            return None
+            return FetchResult.failure(f"http_{response.status_code}")
 
-        return response.json()
+        return FetchResult.success(response.json())
 
     except requests.RequestException as error:
         logger.error("Jenkins API request failed error_type=%s", type(error).__name__)
-        return None
+        return FetchResult.failure(type(error).__name__)
     except ValueError as error:
         logger.error("Jenkins API request failed error_type=%s", type(error).__name__)
-        return None
+        return FetchResult.failure(type(error).__name__)
+
+
+def _safe_get(url):
+    return _fetch(url).data
 
 
 def _job_api_url(job_or_url, suffix="api/json"):
